@@ -238,7 +238,7 @@ BLOCKS = {
     'empty': '░',
 }
 
-SPARK = " ▁▂▃▄▅▆▇█"
+SPARK = "▁▁▂▃▄▅▆▇█"  # Using ▁ instead of space for consistent character width
 
 MODEL_COLORS = {
     "claude-opus-4-5-20251101": (Colors.BRIGHT_MAGENTA, "Opus 4.5"),
