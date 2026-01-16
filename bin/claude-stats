@@ -242,7 +242,8 @@ SPARK = " ▁▂▃▄▅▆▇█"
 
 MODEL_COLORS = {
     "claude-opus-4-5-20251101": (Colors.BRIGHT_MAGENTA, "Opus 4.5"),
-    "claude-sonnet-4-20250514": (Colors.BRIGHT_BLUE, "Sonnet 4"),
+    "claude-sonnet-4-5-20250514": (Colors.BRIGHT_BLUE, "Sonnet 4.5"),
+    "claude-sonnet-4-20250514": (Colors.BLUE, "Sonnet 4"),
     "claude-3-5-sonnet-20241022": (Colors.BLUE, "Sonnet 3.5"),
     "claude-3-5-haiku-20241022": (Colors.CYAN, "Haiku 3.5"),
     "claude-haiku": (Colors.CYAN, "Haiku"),
@@ -252,10 +253,31 @@ MODEL_COLORS = {
 def get_model_display(model: str) -> tuple:
     if model in MODEL_COLORS:
         return MODEL_COLORS[model]
+    # Try partial match (handles different date suffixes)
     for key, val in MODEL_COLORS.items():
         if key in model or model in key:
             return val
-    return (Colors.BRIGHT_WHITE, model[:20])
+    # Try matching model family (strip date suffix for comparison)
+    model_base = '-'.join(model.split('-')[:-1])  # Remove date portion
+    for key, val in MODEL_COLORS.items():
+        key_base = '-'.join(key.split('-')[:-1])
+        if model_base == key_base:
+            return val
+    # Fallback: detect family from name
+    model_lower = model.lower()
+    if "opus" in model_lower:
+        if "4-5" in model or "4.5" in model:
+            return (Colors.BRIGHT_MAGENTA, "Opus 4.5")
+        return (Colors.BRIGHT_MAGENTA, "Opus")
+    elif "sonnet" in model_lower:
+        if "4-5" in model or "4.5" in model:
+            return (Colors.BRIGHT_BLUE, "Sonnet 4.5")
+        elif "3-5" in model or "3.5" in model:
+            return (Colors.BLUE, "Sonnet 3.5")
+        return (Colors.BLUE, "Sonnet")
+    elif "haiku" in model_lower:
+        return (Colors.CYAN, "Haiku")
+    return (Colors.BRIGHT_WHITE, model[:14])
 
 
 def format_number(n: int) -> str:
@@ -854,16 +876,20 @@ def draw_sparkline_graphs(daily: list[dict]) -> list[str]:
     totals = [d["total_tokens"] for d in daily]
     costs = [d.get("cost", 0.0) for d in daily]
 
-    spark_width = min(len(daily), 14)
+    # Fixed width for consistent alignment
+    spark_width = 14
+    label_width = 9
+    value_width = 8
     total_cost = sum(costs)
     cost_color = get_cost_color(total_cost)
 
-    lines.append(f"  {Colors.CYAN}Input    {Colors.RESET} {Colors.CYAN}{sparkline(inputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(inputs)):>8}{Colors.RESET}")
-    lines.append(f"  {Colors.MAGENTA}Output   {Colors.RESET} {Colors.MAGENTA}{sparkline(outputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(outputs)):>8}{Colors.RESET}")
-    lines.append(f"  {Colors.YELLOW}Cache R  {Colors.RESET} {Colors.YELLOW}{sparkline(cache_r, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_r)):>8}{Colors.RESET}")
-    lines.append(f"  {Colors.BLUE}Cache W  {Colors.RESET} {Colors.BLUE}{sparkline(cache_w, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_w)):>8}{Colors.RESET}")
-    lines.append(f"  {Colors.BRIGHT_WHITE}Total    {Colors.RESET} {Colors.BRIGHT_GREEN}{sparkline(totals, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(totals)):>8}{Colors.RESET}")
-    lines.append(f"  {Colors.BRIGHT_YELLOW}Cost     {Colors.RESET} {Colors.BRIGHT_YELLOW}{sparkline_float(costs, spark_width)}{Colors.RESET}  {cost_color}{format_cost(total_cost):>8}{Colors.RESET}")
+    # Format each row with fixed-width columns for alignment
+    lines.append(f"  {Colors.CYAN}{'Input':<{label_width}}{Colors.RESET} {Colors.CYAN}{sparkline(inputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(inputs)):>{value_width}}{Colors.RESET}")
+    lines.append(f"  {Colors.MAGENTA}{'Output':<{label_width}}{Colors.RESET} {Colors.MAGENTA}{sparkline(outputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(outputs)):>{value_width}}{Colors.RESET}")
+    lines.append(f"  {Colors.YELLOW}{'Cache R':<{label_width}}{Colors.RESET} {Colors.YELLOW}{sparkline(cache_r, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_r)):>{value_width}}{Colors.RESET}")
+    lines.append(f"  {Colors.BLUE}{'Cache W':<{label_width}}{Colors.RESET} {Colors.BLUE}{sparkline(cache_w, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_w)):>{value_width}}{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_WHITE}{'Total':<{label_width}}{Colors.RESET} {Colors.BRIGHT_GREEN}{sparkline(totals, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(totals)):>{value_width}}{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_YELLOW}{'Cost':<{label_width}}{Colors.RESET} {Colors.BRIGHT_YELLOW}{sparkline_float(costs, spark_width)}{Colors.RESET}  {cost_color}{format_cost(total_cost):>{value_width}}{Colors.RESET}")
     lines.append("")
 
     return lines
