@@ -11,7 +11,9 @@ Token field mapping (API -> Storage -> Display):
 """
 
 import fcntl
+import hashlib
 import json
+import os
 import shutil
 import sys
 from datetime import datetime, timedelta
@@ -25,13 +27,16 @@ for _lib_path in [_script_dir.parent / "lib", Path.home() / ".claude" / "lib"]:
         sys.path.insert(0, str(_lib_path))
         break
 
-# Try to import from shared module, fallback to inline definitions for backward compatibility
+# Try to import from shared modules, fallback to inline definitions for backward compatibility
 try:
     from pricing import (
         STATS_DIR, PRICING_FILE,
         load_pricing, get_model_pricing, calculate_cost
     )
+    from accounts import detect_account_id, ensure_account_exists
+    ACCOUNTS_AVAILABLE = True
 except ImportError:
+    ACCOUNTS_AVAILABLE = False
     # Fallback for users who haven't reinstalled yet
     STATS_DIR = Path.home() / ".claude" / "stats"
     PRICING_FILE = STATS_DIR / "pricing.json"
@@ -83,6 +88,18 @@ except ImportError:
         cost += (tokens.get("cache_read_tokens", 0) / 1_000_000) * mp.get("cache_read", 0)
         cost += (tokens.get("cache_creation_tokens", 0) / 1_000_000) * mp.get("cache_write", 0)
         return cost
+
+# Fallback account functions for backward compatibility
+if not ACCOUNTS_AVAILABLE:
+    def detect_account_id() -> str:
+        if override := os.environ.get("CLAUDE_STATS_ACCOUNT"):
+            return override
+        if api_key := os.environ.get("ANTHROPIC_API_KEY"):
+            return "api_" + hashlib.sha256(api_key[:20].encode()).hexdigest()[:12]
+        return "default"
+
+    def ensure_account_exists(account_id: str, fetch_org: bool = False) -> dict:
+        return {"name": account_id, "type": "unknown"}
 
 DEBUG_LOG = STATS_DIR / "debug.log"
 LOCK_FILE = STATS_DIR / ".stats.lock"
@@ -465,6 +482,10 @@ def main():
     if session_tokens.get("total_tokens", 0) == 0:
         sys.exit(0)
 
+    # Detect account and ensure it's registered (fetches org info once for new accounts)
+    account_id = detect_account_id()
+    ensure_account_exists(account_id, fetch_org=True)
+
     today = datetime.now().strftime("%Y-%m-%d")
     stats_file = STATS_DIR / f"{today}.json"
 
@@ -477,6 +498,7 @@ def main():
 
             session_entry = {
                 "session_id": session_id,
+                "account_id": account_id,
                 "date": today,  # Track which date this session entry belongs to
                 "last_updated": datetime.now().isoformat(),
                 "project": cwd,

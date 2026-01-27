@@ -23,13 +23,16 @@ for _lib_path in [_script_dir.parent / "lib", Path.home() / ".claude" / "lib"]:
         sys.path.insert(0, str(_lib_path))
         break
 
-# Try to import from shared module, fallback to inline definitions for backward compatibility
+# Try to import from shared modules, fallback to inline definitions for backward compatibility
 try:
     from pricing import (
         DEFAULT_PRICING, FAMILY_PRICING, STATS_DIR, PRICING_FILE,
         load_pricing, get_model_pricing, calculate_cost
     )
+    from accounts import list_accounts, get_account_name, set_account_name, load_accounts
+    ACCOUNTS_AVAILABLE = True
 except ImportError:
+    ACCOUNTS_AVAILABLE = False
     # Fallback for users who haven't reinstalled yet
     STATS_DIR = Path.home() / ".claude" / "stats"
     PRICING_FILE = STATS_DIR / "pricing.json"
@@ -81,6 +84,66 @@ except ImportError:
         cost += (tokens.get("cache_read_tokens", 0) / 1_000_000) * mp.get("cache_read", 0)
         cost += (tokens.get("cache_creation_tokens", 0) / 1_000_000) * mp.get("cache_write", 0)
         return cost
+
+# Fallback account functions for backward compatibility
+if not ACCOUNTS_AVAILABLE:
+    ACCOUNTS_FILE = STATS_DIR / "accounts.json"
+
+    def list_accounts() -> list[tuple[str, str]]:
+        """List all known accounts from accounts.json."""
+        if ACCOUNTS_FILE.exists():
+            try:
+                with open(ACCOUNTS_FILE, "r") as f:
+                    data = json.load(f)
+                    accounts = []
+                    for acc_id, info in data.get("accounts", {}).items():
+                        name = info.get("name", acc_id)
+                        last_seen = info.get("last_seen", "")
+                        accounts.append((acc_id, name, last_seen))
+                    accounts.sort(key=lambda x: x[2], reverse=True)
+                    return [(a[0], a[1]) for a in accounts]
+            except (json.JSONDecodeError, IOError):
+                pass
+        return []
+
+    def get_account_name(account_id: str) -> str:
+        """Get display name for an account."""
+        if account_id == "default":
+            return "Legacy"
+        if ACCOUNTS_FILE.exists():
+            try:
+                with open(ACCOUNTS_FILE, "r") as f:
+                    data = json.load(f)
+                    return data.get("accounts", {}).get(account_id, {}).get("name", account_id)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return account_id
+
+    def set_account_name(account_id: str, name: str) -> None:
+        """Set display name for an account."""
+        STATS_DIR.mkdir(parents=True, exist_ok=True)
+        data = {"version": 1, "accounts": {}}
+        if ACCOUNTS_FILE.exists():
+            try:
+                with open(ACCOUNTS_FILE, "r") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+        if account_id not in data.get("accounts", {}):
+            data["accounts"][account_id] = {}
+        data["accounts"][account_id]["name"] = name
+        with open(ACCOUNTS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def load_accounts() -> dict:
+        """Load accounts data."""
+        if ACCOUNTS_FILE.exists():
+            try:
+                with open(ACCOUNTS_FILE, "r") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return {"version": 1, "accounts": {}}
 
 REFRESH_INTERVAL = 2  # seconds
 CONTENT_WIDTH = 75  # Fixed content width for centering
@@ -284,8 +347,15 @@ def get_recent_buckets(window_minutes: int = 30) -> list[dict]:
     return result
 
 
-def aggregate_stats(from_date: str, to_date: str) -> dict:
-    """Aggregate stats across a date range with detailed daily breakdown."""
+def aggregate_stats(from_date: str, to_date: str, account_filter: Optional[str] = None) -> dict:
+    """Aggregate stats across a date range with detailed daily breakdown.
+
+    Args:
+        from_date: Start date in YYYY-MM-DD format
+        to_date: End date in YYYY-MM-DD format
+        account_filter: If set, only include sessions from this account.
+                       None or "ALL" means all accounts.
+    """
     pricing = load_pricing()
     result = {
         "input_tokens": 0,
@@ -307,6 +377,10 @@ def aggregate_stats(from_date: str, to_date: str) -> dict:
     if current > end:
         current, end = end, current
 
+    # Normalize account filter
+    if account_filter == "ALL":
+        account_filter = None
+
     while current <= end:
         date_str = current.strftime("%Y-%m-%d")
         stats = load_stats(date_str)
@@ -324,20 +398,85 @@ def aggregate_stats(from_date: str, to_date: str) -> dict:
         }
 
         if stats:
-            totals = stats.get("daily_totals", {})
-            daily_entry["input_tokens"] = totals.get("input_tokens", 0)
-            daily_entry["output_tokens"] = totals.get("output_tokens", 0)
-            daily_entry["cache_read_tokens"] = totals.get("cache_read_tokens", 0)
-            daily_entry["cache_creation_tokens"] = totals.get("cache_creation_tokens", 0)
-            daily_entry["total_tokens"] = totals.get("total_tokens", 0)
-            daily_entry["request_count"] = totals.get("request_count", 0)
-            daily_entry["session_count"] = totals.get("session_count", 0)
-            daily_entry["cost"] = totals.get("cost", 0.0)
+            # If filtering by account, aggregate from sessions
+            if account_filter is not None:
+                # Aggregate from individual sessions
+                by_model_daily = {}
+                for session in stats.get("sessions", []):
+                    # Sessions without account_id are treated as "default"
+                    session_account = session.get("account_id", "default")
+                    if session_account != account_filter:
+                        continue
 
-            # Recalculate cost if not stored (backward compatibility)
-            if daily_entry["cost"] == 0.0 and daily_entry["total_tokens"] > 0:
-                for model, ms in stats.get("by_model", {}).items():
-                    daily_entry["cost"] += calculate_cost(ms, model, pricing)
+                    daily_entry["input_tokens"] += session.get("input_tokens", 0)
+                    daily_entry["output_tokens"] += session.get("output_tokens", 0)
+                    daily_entry["cache_read_tokens"] += session.get("cache_read_tokens", 0)
+                    daily_entry["cache_creation_tokens"] += session.get("cache_creation_tokens", 0)
+                    daily_entry["total_tokens"] += session.get("total_tokens", 0)
+                    daily_entry["request_count"] += session.get("request_count", 0)
+                    daily_entry["session_count"] += 1
+                    daily_entry["cost"] += session.get("cost", 0.0)
+
+                    # Aggregate by_model
+                    for model, ms in session.get("by_model", {}).items():
+                        if model not in by_model_daily:
+                            by_model_daily[model] = {
+                                "input_tokens": 0, "output_tokens": 0,
+                                "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                                "request_count": 0, "cost": 0.0,
+                            }
+                        for key in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "request_count"]:
+                            by_model_daily[model][key] += ms.get(key, 0)
+                        model_cost = ms.get("cost", 0.0)
+                        if model_cost == 0.0:
+                            model_cost = calculate_cost(ms, model, pricing)
+                        by_model_daily[model]["cost"] += model_cost
+
+                # Recalculate cost if needed
+                if daily_entry["cost"] == 0.0 and daily_entry["total_tokens"] > 0:
+                    for model, ms in by_model_daily.items():
+                        daily_entry["cost"] += ms.get("cost", 0.0)
+
+                # Merge by_model_daily into result
+                for model, model_stats in by_model_daily.items():
+                    if model not in result["by_model"]:
+                        result["by_model"][model] = {
+                            "input_tokens": 0, "output_tokens": 0,
+                            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                            "request_count": 0, "cost": 0.0,
+                        }
+                    for key in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "request_count", "cost"]:
+                        result["by_model"][model][key] += model_stats.get(key, 0)
+            else:
+                # No filter - use daily_totals for efficiency
+                totals = stats.get("daily_totals", {})
+                daily_entry["input_tokens"] = totals.get("input_tokens", 0)
+                daily_entry["output_tokens"] = totals.get("output_tokens", 0)
+                daily_entry["cache_read_tokens"] = totals.get("cache_read_tokens", 0)
+                daily_entry["cache_creation_tokens"] = totals.get("cache_creation_tokens", 0)
+                daily_entry["total_tokens"] = totals.get("total_tokens", 0)
+                daily_entry["request_count"] = totals.get("request_count", 0)
+                daily_entry["session_count"] = totals.get("session_count", 0)
+                daily_entry["cost"] = totals.get("cost", 0.0)
+
+                # Recalculate cost if not stored (backward compatibility)
+                if daily_entry["cost"] == 0.0 and daily_entry["total_tokens"] > 0:
+                    for model, ms in stats.get("by_model", {}).items():
+                        daily_entry["cost"] += calculate_cost(ms, model, pricing)
+
+                for model, model_stats in stats.get("by_model", {}).items():
+                    if model not in result["by_model"]:
+                        result["by_model"][model] = {
+                            "input_tokens": 0, "output_tokens": 0,
+                            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                            "request_count": 0, "cost": 0.0,
+                        }
+                    for key in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "request_count"]:
+                        result["by_model"][model][key] += model_stats.get(key, 0)
+                    model_cost = model_stats.get("cost", 0.0)
+                    if model_cost == 0.0:
+                        model_cost = calculate_cost(model_stats, model, pricing)
+                    result["by_model"][model]["cost"] += model_cost
 
             result["input_tokens"] += daily_entry["input_tokens"]
             result["output_tokens"] += daily_entry["output_tokens"]
@@ -347,24 +486,6 @@ def aggregate_stats(from_date: str, to_date: str) -> dict:
             result["request_count"] += daily_entry["request_count"]
             result["session_count"] += daily_entry["session_count"]
             result["cost"] += daily_entry["cost"]
-
-            for model, model_stats in stats.get("by_model", {}).items():
-                if model not in result["by_model"]:
-                    result["by_model"][model] = {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cache_read_tokens": 0,
-                        "cache_creation_tokens": 0,
-                        "request_count": 0,
-                        "cost": 0.0,
-                    }
-                for key in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "request_count"]:
-                    result["by_model"][model][key] += model_stats.get(key, 0)
-                # Aggregate cost, recalculate if not stored
-                model_cost = model_stats.get("cost", 0.0)
-                if model_cost == 0.0:
-                    model_cost = calculate_cost(model_stats, model, pricing)
-                result["by_model"][model]["cost"] += model_cost
 
         result["daily"].append(daily_entry)
         current += timedelta(days=1)
@@ -475,6 +596,89 @@ def draw_date_picker(from_date: datetime, to_date: datetime, selected: int) -> l
     lines.append("")
 
     return lines
+
+
+def draw_account_picker(current_account: str, accounts: list[tuple[str, str]]) -> list[str]:
+    """Draw the account selector UI.
+
+    Args:
+        current_account: Current account ID or "ALL"
+        accounts: List of (account_id, display_name) tuples
+    """
+    lines = []
+
+    if current_account == "ALL":
+        display_name = "All Accounts"
+    else:
+        display_name = get_account_name(current_account)
+        # For API key accounts, show the key hint if available
+        if current_account.startswith("api_"):
+            account_info = load_accounts().get("accounts", {}).get(current_account, {})
+            if key_hint := account_info.get("key_hint"):
+                display_name = f"{display_name} ({key_hint})"
+
+    lines.append(f"  {Colors.BOLD}👤 Account:{Colors.RESET} {Colors.REVERSE}{Colors.BRIGHT_YELLOW} {display_name} {Colors.RESET}  {Colors.DIM}A: cycle  E: edit name{Colors.RESET}")
+    lines.append("")
+
+    return lines
+
+
+def get_accounts_with_legacy(accounts: list[tuple[str, str]], from_date: str, to_date: str) -> list[tuple[str, str]]:
+    """Get accounts list, adding 'default' if there are legacy sessions in date range."""
+    # Check if default is already in the list
+    has_default = any(acc_id == "default" for acc_id, _ in accounts)
+    if has_default:
+        return accounts
+
+    # Check if there are any sessions without account_id in the date range
+    current = datetime.strptime(from_date, "%Y-%m-%d")
+    end = datetime.strptime(to_date, "%Y-%m-%d")
+    if current > end:
+        current, end = end, current
+
+    while current <= end:
+        date_str = current.strftime("%Y-%m-%d")
+        stats = load_stats(date_str)
+        if stats:
+            for session in stats.get("sessions", []):
+                if "account_id" not in session:
+                    # Found a legacy session, add default to the list
+                    return accounts + [("default", "Legacy")]
+        current += timedelta(days=1)
+
+    return accounts
+
+
+def get_text_input(prompt: str) -> Optional[str]:
+    """Get text input from user with simple line editing."""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    show_cursor()
+    print(f"\n  {Colors.BOLD}{prompt}{Colors.RESET} ", end="", flush=True)
+
+    try:
+        tty.setraw(sys.stdin.fileno())
+        buffer = []
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == '\r' or ch == '\n':
+                print()
+                return ''.join(buffer) if buffer else None
+            elif ch == '\x03' or ch == '\x1b':  # Ctrl+C or Escape
+                print()
+                return None
+            elif ch == '\x7f' or ch == '\b':  # Backspace
+                if buffer:
+                    buffer.pop()
+                    # Move cursor back, overwrite with space, move back again
+                    print('\b \b', end="", flush=True)
+            elif ch.isprintable():
+                buffer.append(ch)
+                print(ch, end="", flush=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        hide_cursor()
 
 
 def draw_summary(stats: dict, from_date: str, to_date: str) -> list[str]:
@@ -654,12 +858,12 @@ def draw_sparkline_graphs(daily: list[dict]) -> list[str]:
     total_cost = sum(costs)
     cost_color = get_cost_color(total_cost)
 
-    lines.append(f"  {Colors.CYAN}Input    {Colors.RESET} {Colors.CYAN}{sparkline(inputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(inputs))}{Colors.RESET}")
-    lines.append(f"  {Colors.MAGENTA}Output   {Colors.RESET} {Colors.MAGENTA}{sparkline(outputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(outputs))}{Colors.RESET}")
-    lines.append(f"  {Colors.YELLOW}Cache R  {Colors.RESET} {Colors.YELLOW}{sparkline(cache_r, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_r))}{Colors.RESET}")
-    lines.append(f"  {Colors.BLUE}Cache W  {Colors.RESET} {Colors.BLUE}{sparkline(cache_w, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_w))}{Colors.RESET}")
-    lines.append(f"  {Colors.BRIGHT_WHITE}Total    {Colors.RESET} {Colors.BRIGHT_GREEN}{sparkline(totals, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(totals))}{Colors.RESET}")
-    lines.append(f"  {Colors.BRIGHT_YELLOW}Cost     {Colors.RESET} {Colors.BRIGHT_YELLOW}{sparkline_float(costs, spark_width)}{Colors.RESET}  {cost_color}{format_cost(total_cost)}{Colors.RESET}")
+    lines.append(f"  {Colors.CYAN}Input    {Colors.RESET} {Colors.CYAN}{sparkline(inputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(inputs)):>8}{Colors.RESET}")
+    lines.append(f"  {Colors.MAGENTA}Output   {Colors.RESET} {Colors.MAGENTA}{sparkline(outputs, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(outputs)):>8}{Colors.RESET}")
+    lines.append(f"  {Colors.YELLOW}Cache R  {Colors.RESET} {Colors.YELLOW}{sparkline(cache_r, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_r)):>8}{Colors.RESET}")
+    lines.append(f"  {Colors.BLUE}Cache W  {Colors.RESET} {Colors.BLUE}{sparkline(cache_w, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(cache_w)):>8}{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_WHITE}Total    {Colors.RESET} {Colors.BRIGHT_GREEN}{sparkline(totals, spark_width)}{Colors.RESET}  {Colors.DIM}{format_tokens_short(sum(totals)):>8}{Colors.RESET}")
+    lines.append(f"  {Colors.BRIGHT_YELLOW}Cost     {Colors.RESET} {Colors.BRIGHT_YELLOW}{sparkline_float(costs, spark_width)}{Colors.RESET}  {cost_color}{format_cost(total_cost):>8}{Colors.RESET}")
     lines.append("")
 
     return lines
@@ -880,6 +1084,27 @@ def draw_stacked_bar_chart(daily: list[dict]) -> list[str]:
     return lines
 
 
+PREFS_FILE = STATS_DIR / "viewer_prefs.json"
+
+
+def load_prefs() -> dict:
+    """Load viewer preferences."""
+    if PREFS_FILE.exists():
+        try:
+            with open(PREFS_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {}
+
+
+def save_prefs(prefs: dict) -> None:
+    """Save viewer preferences."""
+    STATS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PREFS_FILE, "w") as f:
+        json.dump(prefs, f, indent=2)
+
+
 def interactive_mode():
     """Run interactive date picker mode with stats and realtime views."""
     today = datetime.now()
@@ -887,6 +1112,17 @@ def interactive_mode():
     to_date = today
     selected = 0
     view = 'stats'  # 'stats' or 'realtime'
+
+    # Load saved preferences
+    prefs = load_prefs()
+
+    # Account selection state - restore from prefs or default to "ALL"
+    current_account = prefs.get("last_account", "ALL")
+    accounts = list_accounts()  # List of (id, name) tuples
+
+    # Validate saved account still exists
+    if current_account != "ALL" and not any(acc_id == current_account for acc_id, _ in accounts):
+        current_account = "ALL"
 
     # Set up signal handlers for clean exit on Ctrl+C
     def cleanup_handler(signum, frame):
@@ -903,6 +1139,9 @@ def interactive_mode():
         while True:
             clear_screen()
             today = datetime.now()  # Update today on each refresh
+
+            # Refresh accounts list periodically
+            accounts = list_accounts()
 
             if view == 'realtime':
                 # Real-time throughput view
@@ -924,11 +1163,17 @@ def interactive_mode():
             from_str = from_date.strftime("%Y-%m-%d")
             to_str = to_date.strftime("%Y-%m-%d")
 
-            stats = aggregate_stats(from_str, to_str)
+            # Include "default" account if there are legacy sessions
+            accounts = get_accounts_with_legacy(accounts, from_str, to_str)
+
+            # Pass account filter to aggregate_stats
+            account_filter = None if current_account == "ALL" else current_account
+            stats = aggregate_stats(from_str, to_str, account_filter)
 
             output = []
             output.extend(draw_header())
             output.extend(draw_date_picker(from_date, to_date, selected))
+            output.extend(draw_account_picker(current_account, accounts))
             output.extend(draw_summary(stats, from_str, to_str))
             output.extend(draw_model_breakdown(stats.get("by_model", {})))
             output.extend(draw_sparkline_graphs(stats.get("daily", [])))
@@ -975,6 +1220,33 @@ def interactive_mode():
             elif key == 'm' or key == 'M':
                 from_date = today - timedelta(days=29)
                 to_date = today
+            elif key == 'a' or key == 'A':
+                # Cycle through accounts: ALL -> account1 -> account2 -> ... -> ALL
+                if not accounts:
+                    current_account = "ALL"
+                elif current_account == "ALL":
+                    current_account = accounts[0][0]  # First account
+                else:
+                    # Find current index and move to next
+                    try:
+                        idx = next(i for i, (acc_id, _) in enumerate(accounts) if acc_id == current_account)
+                        if idx + 1 < len(accounts):
+                            current_account = accounts[idx + 1][0]
+                        else:
+                            current_account = "ALL"
+                    except StopIteration:
+                        current_account = "ALL"
+                # Save preference
+                prefs["last_account"] = current_account
+                save_prefs(prefs)
+            elif key == 'e' or key == 'E':
+                # Edit current account name
+                if current_account != "ALL":
+                    current_name = get_account_name(current_account)
+                    new_name = get_text_input(f"Rename '{current_name}' to:")
+                    if new_name and new_name.strip():
+                        set_account_name(current_account, new_name.strip())
+                        accounts = list_accounts()  # Refresh list
 
     finally:
         # Restore original signal handlers
@@ -998,6 +1270,9 @@ Interactive controls:
   T       Today only
   W       Last 7 days (Week)
   M       Last 30 days (Month)
+  A       Cycle through accounts
+  E       Edit current account name
+  R       Real-time throughput view
   Q       Quit
 
 {Colors.DIM}Legend:{Colors.RESET}

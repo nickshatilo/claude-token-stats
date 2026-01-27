@@ -31,9 +31,10 @@ mkdir -p "$HOOKS_DIR"
 mkdir -p "$STATS_DIR"
 mkdir -p "$LIB_DIR"
 
-# Copy shared library
+# Copy shared libraries
 echo -e "${CYAN}Installing shared modules...${NC}"
 cp "$SCRIPT_DIR/lib/pricing.py" "$LIB_DIR/pricing.py"
+cp "$SCRIPT_DIR/lib/accounts.py" "$LIB_DIR/accounts.py"
 
 # Copy hook script
 echo -e "${CYAN}Installing hook script...${NC}"
@@ -133,7 +134,8 @@ echo -e "${CYAN}Features:${NC}"
 echo -e "  - Auto-logs token usage after each Claude response"
 echo -e "  - Per-model breakdown (Opus, Sonnet, Haiku)"
 echo -e "  - Input/Output/Cache tokens tracked separately"
-echo -e "  - Interactive date range picker"
+echo -e "  - Multi-account support (API keys, orgs)"
+echo -e "  - Interactive date range and account picker"
 echo -e "  - Auto-refreshing display"
 echo ""
 echo -e "${YELLOW}Note:${NC} Restart your shell or run 'source $SHELL_RC' to use the alias"
